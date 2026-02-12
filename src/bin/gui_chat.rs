@@ -1,30 +1,70 @@
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Sender, Receiver};
+use std::collections::{HashMap, HashSet};
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum ModelSize {
     Small,    // 0.5B
     Medium,   // 1.5B
     Large,    // 7B
+    XLarge,   // 14B
 }
 
 impl ModelSize {
     fn path(&self) -> PathBuf {
-        let base = "/Users/yao/Desktop/code/work/mofa-org/mofa-input/models";
+        let base = dirs::home_dir()
+            .map(|h| h.join(".mofa/models"))
+            .unwrap_or_else(|| PathBuf::from("./models"));
+
+        std::fs::create_dir_all(&base).ok();
+
         match self {
-            ModelSize::Small => PathBuf::from(base).join("qwen2.5-0.5b-q4_k_m.gguf"),
-            ModelSize::Medium => PathBuf::from(base).join("qwen2.5-1.5b-q4_k_m.gguf"),
-            ModelSize::Large => PathBuf::from(base).join("qwen2.5-7b-q4_k_m.gguf"),
+            ModelSize::Small => base.join("qwen2.5-0.5b-q4_k_m.gguf"),
+            ModelSize::Medium => base.join("qwen2.5-1.5b-q4_k_m.gguf"),
+            ModelSize::Large => base.join("qwen2.5-7b-q4_k_m.gguf"),
+            ModelSize::XLarge => base.join("qwen2.5-14b-q4_k_m.gguf"),
         }
     }
 
     fn name(&self) -> &'static str {
         match self {
-            ModelSize::Small => "0.5B (快)",
-            ModelSize::Medium => "1.5B (均衡)",
-            ModelSize::Large => "7B (智能)",
+            ModelSize::Small => "0.5B",
+            ModelSize::Medium => "1.5B",
+            ModelSize::Large => "7B",
+            ModelSize::XLarge => "14B",
         }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            ModelSize::Small => "超快，适合简单任务 (~400MB)",
+            ModelSize::Medium => "推荐，速度与质量均衡 (~1GB)",
+            ModelSize::Large => "更智能，需更多内存 (~4.5GB)",
+            ModelSize::XLarge => "最聪明，推理能力强 (~9GB)",
+        }
+    }
+
+    fn size_mb(&self) -> u64 {
+        match self {
+            ModelSize::Small => 400,
+            ModelSize::Medium => 1000,
+            ModelSize::Large => 4500,
+            ModelSize::XLarge => 9000,
+        }
+    }
+
+    fn download_url(&self) -> &'static str {
+        match self {
+            ModelSize::Small => "https://huggingface.co/lmstudio-community/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf",
+            ModelSize::Medium => "https://huggingface.co/lmstudio-community/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+            ModelSize::Large => "https://huggingface.co/lmstudio-community/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+            ModelSize::XLarge => "https://huggingface.co/lmstudio-community/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+        }
+    }
+
+    fn all() -> [ModelSize; 4] {
+        [ModelSize::Small, ModelSize::Medium, ModelSize::Large, ModelSize::XLarge]
     }
 }
 
@@ -38,14 +78,17 @@ enum AppEvent {
     GenerationComplete,
     ModelLoaded,
     Error(String),
+    DownloadProgress(ModelSize, f32), // model, percent
+    DownloadComplete(ModelSize),
+    DownloadError(ModelSize, String),
 }
 
 struct ChatApp {
     chat: Option<mofa_input::llm::ChatSession>,
     messages: Vec<ChatMessage>,
     input: String,
-    selected_model: ModelSize,      // 当前选择的模型（UI状态）
-    loaded_model: Option<ModelSize>, // 实际已加载的模型
+    selected_model: ModelSize,
+    loaded_model: Option<ModelSize>,
     is_loading: bool,
     is_generating: bool,
     status: String,
@@ -53,8 +96,13 @@ struct ChatApp {
     event_receiver: Receiver<AppEvent>,
     event_sender: Sender<AppEvent>,
     current_response: String,
-    show_switch_confirm: bool,      // 是否显示切换确认对话框
-    pending_model: Option<ModelSize>, // 待切换的模型
+    show_switch_confirm: bool,
+    pending_model: Option<ModelSize>,
+    download_progress: HashMap<ModelSize, f32>,
+    downloading_models: HashSet<ModelSize>,
+    show_download_manager: bool,
+    show_delete_confirm: bool,
+    pending_delete: Option<ModelSize>,
 }
 
 impl ChatApp {
@@ -68,20 +116,154 @@ impl ChatApp {
             loaded_model: None,
             is_loading: false,
             is_generating: false,
-            status: "请选择模型并点击加载".to_string(),
+            status: "请选择模型".to_string(),
             token_count: 0,
             event_receiver: rx,
             event_sender: tx,
             current_response: String::new(),
             show_switch_confirm: false,
             pending_model: None,
+            download_progress: HashMap::new(),
+            downloading_models: HashSet::new(),
+            show_download_manager: false,
+            show_delete_confirm: false,
+            pending_delete: None,
+        }
+    }
+
+    fn is_model_available(&self, model: ModelSize) -> bool {
+        model.path().exists() && !self.downloading_models.contains(&model)
+    }
+
+    fn cancel_download(&mut self, model: ModelSize) {
+        self.downloading_models.remove(&model);
+        self.download_progress.remove(&model);
+        let path = model.path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        self.status = format!("{} 下载已取消", model.name());
+    }
+
+    fn delete_model(&mut self, model: ModelSize) {
+        if self.loaded_model == Some(model) {
+            self.chat = None;
+            self.loaded_model = None;
+            self.token_count = 0;
+        }
+        let path = model.path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        self.status = format!("{} 已删除", model.name());
+    }
+
+    fn has_download_tool() -> bool {
+        use std::process::{Command, Stdio};
+        Command::new("wget").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+            || Command::new("curl").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok()
+    }
+
+    fn download_model(&mut self, model: ModelSize) {
+        if self.downloading_models.contains(&model) {
+            return;
+        }
+
+        if !Self::has_download_tool() {
+            self.status = "错误: 未找到wget或curl，请手动安装".to_string();
+            return;
+        }
+
+        self.downloading_models.insert(model);
+        let sender = self.event_sender.clone();
+        let url = model.download_url().to_string();
+        let path = model.path();
+
+        std::thread::spawn(move || {
+            // Create parent directory
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            // Download with progress
+            match Self::download_with_progress(&url, &path, model, sender.clone()) {
+                Ok(_) => {
+                    let _ = sender.send(AppEvent::DownloadComplete(model));
+                }
+                Err(e) => {
+                    let _ = sender.send(AppEvent::DownloadError(model, e));
+                }
+            }
+        });
+    }
+
+    fn download_with_progress(
+        url: &str,
+        path: &PathBuf,
+        model: ModelSize,
+        sender: Sender<AppEvent>,
+    ) -> Result<(), String> {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::Duration;
+
+        let path_str = path.to_string_lossy().to_string();
+        let url = url.to_string();
+        let expected_size = model.size_mb() * 1024 * 1024;
+
+        let _ = sender.send(AppEvent::DownloadProgress(model, 0.0));
+
+        // Try wget first, then curl
+        let has_wget = Command::new("wget").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok();
+        let mut child = if has_wget {
+            let mut c = Command::new("wget");
+            c.args([&url, "-O", &path_str, "--timeout=60", "--tries=3", "-q"])
+             .stdout(Stdio::null())
+             .stderr(Stdio::null())
+             .spawn()
+             .map_err(|e| format!("启动wget失败: {}", e))?
+        } else if Command::new("curl").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok() {
+            let mut c = Command::new("curl");
+            c.args(["-L", "-o", &path_str, &url, "--connect-timeout", "60", "--max-time", "600", "-s"])
+             .stdout(Stdio::null())
+             .stderr(Stdio::null())
+             .spawn()
+             .map_err(|e| format!("启动curl失败: {}", e))?
+        } else {
+            return Err("未找到wget或curl，请手动安装".to_string());
+        };
+
+        let path_clone = path.clone();
+        let sender_clone = sender.clone();
+        let progress_handle = thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                if let Ok(metadata) = std::fs::metadata(&path_clone) {
+                    let downloaded = metadata.len();
+                    let percent = (downloaded as f64 / expected_size as f64 * 100.0).min(99.0);
+                    let _ = sender_clone.send(AppEvent::DownloadProgress(model, percent as f32));
+                }
+            }
+        });
+
+        let result = child.wait()
+            .map_err(|e| format!("等待下载失败: {}", e))?;
+
+        // Stop progress monitoring
+        drop(progress_handle);
+
+        if result.success() {
+            let _ = sender.send(AppEvent::DownloadProgress(model, 100.0));
+            Ok(())
+        } else {
+            Err("下载失败".to_string())
         }
     }
 
     fn load_model(&mut self) {
         let model_path = self.selected_model.path();
         if !model_path.exists() {
-            self.status = format!("模型文件不存在");
+            self.status = format!("模型未下载");
             return;
         }
 
@@ -102,25 +284,26 @@ impl ChatApp {
     }
 
     fn switch_model(&mut self, new_model: ModelSize) {
-        // 如果当前没有模型，直接加载
+        if !new_model.path().exists() {
+            self.download_model(new_model);
+            return;
+        }
+
         if self.chat.is_none() {
             self.selected_model = new_model;
             self.load_model();
             return;
         }
 
-        // 如果选择的是同一个模型，无需切换
         if self.loaded_model == Some(new_model) {
-            self.status = format!("{} 模型已在运行", new_model.name());
+            self.status = format!("{} 已在运行", new_model.name());
             return;
         }
 
-        // 如果有对话历史，显示确认对话框
         if !self.messages.is_empty() {
             self.pending_model = Some(new_model);
             self.show_switch_confirm = true;
         } else {
-            // 没有对话历史，直接切换
             self.selected_model = new_model;
             self.chat = None;
             self.loaded_model = None;
@@ -145,7 +328,6 @@ impl ChatApp {
     fn cancel_switch(&mut self) {
         self.show_switch_confirm = false;
         self.pending_model = None;
-        // 恢复选择为当前加载的模型
         if let Some(loaded) = self.loaded_model {
             self.selected_model = loaded;
         }
@@ -159,13 +341,11 @@ impl ChatApp {
         let message = self.input.trim().to_string();
         self.input.clear();
 
-        // Add user message
         self.messages.push(ChatMessage {
             role: "user".to_string(),
             content: message.clone(),
         });
 
-        // Add placeholder for assistant
         self.current_response = String::new();
         self.messages.push(ChatMessage {
             role: "assistant".to_string(),
@@ -175,11 +355,9 @@ impl ChatApp {
         self.is_generating = true;
         self.status = "生成中...".to_string();
 
-        // Clone chat session for the background thread
         let chat = self.chat.clone().unwrap();
         let sender = self.event_sender.clone();
 
-        // Run generation in background thread so UI can receive tokens in real-time
         std::thread::spawn(move || {
             let sender2 = sender.clone();
             chat.send_stream(&message, 512, 0.7, move |token| {
@@ -213,18 +391,31 @@ impl ChatApp {
                     if let Some(chat) = &self.chat {
                         self.token_count = chat.token_count();
                     }
-                    self.status = format!("就绪 (KV缓存: {} tokens)", self.token_count);
+                    self.status = format!("就绪 ({} tokens)", self.token_count);
                 }
                 AppEvent::ModelLoaded => {
                     let model_path = self.selected_model.path();
                     self.chat = mofa_input::llm::ChatSession::new(&model_path).ok();
                     self.loaded_model = Some(self.selected_model);
                     self.is_loading = false;
-                    self.status = format!("{} 模型已加载！", self.selected_model.name());
+                    self.status = format!("{} 已就绪", self.selected_model.name());
                 }
                 AppEvent::Error(e) => {
                     self.is_loading = false;
                     self.status = format!("错误: {}", e);
+                }
+                AppEvent::DownloadProgress(model, percent) => {
+                    self.download_progress.insert(model, percent);
+                    self.status = format!("{} 下载中... {:.1}%", model.name(), percent);
+                }
+                AppEvent::DownloadComplete(model) => {
+                    self.downloading_models.remove(&model);
+                    self.download_progress.remove(&model);
+                    self.status = format!("{} 下载完成，点击加载", model.name());
+                }
+                AppEvent::DownloadError(model, e) => {
+                    self.downloading_models.remove(&model);
+                    self.status = format!("{} 下载失败: {}", model.name(), e);
                 }
             }
         }
@@ -233,26 +424,24 @@ impl ChatApp {
 
 impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Handle background events
         self.handle_events();
 
-        // Request continuous updates while generating
         if self.is_generating {
             ctx.request_repaint();
         }
 
-        // Model switch confirmation dialog
+        // Model switch confirmation
         if self.show_switch_confirm {
             egui::Window::new("切换模型")
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label(format!(
-                        "切换到 {} 将清空当前对话历史。\n是否继续？",
+                        "切换到 {} 将清空当前对话。\n是否继续？",
                         self.pending_model.map(|m| m.name()).unwrap_or("")
                     ));
                     ui.horizontal(|ui| {
-                        if ui.button("确认切换").clicked() {
+                        if ui.button("确认").clicked() {
                             self.confirm_switch();
                         }
                         if ui.button("取消").clicked() {
@@ -262,31 +451,170 @@ impl eframe::App for ChatApp {
                 });
         }
 
+        // Delete model confirmation
+        if self.show_delete_confirm {
+            egui::Window::new("删除模型")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "确认删除 {} 模型？\n此操作不可恢复。",
+                        self.pending_delete.map(|m| m.name()).unwrap_or("")
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui.button("确认删除").clicked() {
+                            if let Some(model) = self.pending_delete {
+                                self.delete_model(model);
+                            }
+                            self.show_delete_confirm = false;
+                            self.pending_delete = None;
+                        }
+                        if ui.button("取消").clicked() {
+                            self.show_delete_confirm = false;
+                            self.pending_delete = None;
+                        }
+                    });
+                });
+        }
+
+        // Download manager window
+        if self.show_download_manager {
+            egui::Window::new("模型管理")
+                .collapsible(false)
+                .resizable(true)
+                .default_size([400.0, 300.0])
+                .show(ctx, |ui| {
+                    ui.label("模型存储位置: ~/.mofa/models/");
+                    ui.separator();
+
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for model in ModelSize::all() {
+                            let available = self.is_model_available(model);
+                            let downloading = self.downloading_models.contains(&model);
+
+                            ui.horizontal(|ui| {
+                                ui.strong(model.name());
+                                ui.label(model.description());
+                            });
+
+                            ui.horizontal(|ui| {
+                                if downloading {
+                                    // Downloading - show progress and cancel button
+                                    if let Some(&progress) = self.download_progress.get(&model) {
+                                        let progress_bar = egui::ProgressBar::new(progress / 100.0)
+                                            .text(format!("{:.1}%", progress))
+                                            .desired_height(20.0)
+                                            .desired_width(150.0);
+                                        ui.add(progress_bar);
+                                    } else {
+                                        ui.spinner();
+                                        ui.label("准备下载...");
+                                    }
+                                    let cancel_btn = egui::Button::new("取消")
+                                        .fill(egui::Color32::from_rgb(239, 68, 68));
+                                    if ui.add(cancel_btn).clicked() {
+                                        self.cancel_download(model);
+                                    }
+                                } else if available {
+                                    // Downloaded - show load/delete buttons
+                                    ui.colored_label(egui::Color32::GREEN, "✓ 已下载");
+                                    if self.loaded_model == Some(model) {
+                                        ui.colored_label(egui::Color32::GREEN, "● 运行中");
+                                        if ui.button("🗑 删除").clicked() {
+                                            self.pending_delete = Some(model);
+                                            self.show_delete_confirm = true;
+                                        }
+                                    } else {
+                                        if ui.button("加载").clicked() {
+                                            self.switch_model(model);
+                                            self.show_download_manager = false;
+                                        }
+                                        let delete_btn = egui::Button::new("🗑 删除")
+                                            .fill(egui::Color32::from_rgb(239, 68, 68));
+                                        if ui.add(delete_btn).clicked() {
+                                            self.pending_delete = Some(model);
+                                            self.show_delete_confirm = true;
+                                        }
+                                    }
+                                } else {
+                                    ui.colored_label(egui::Color32::RED, "✗ 未下载");
+                                    if ui.button("下载").clicked() {
+                                        self.download_model(model);
+                                    }
+                                }
+                            });
+
+                            ui.separator();
+                        }
+                    });
+
+                    if ui.button("关闭").clicked() {
+                        self.show_download_manager = false;
+                    }
+                });
+        }
+
         // Top panel
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Model selection buttons - clicking switches model
-                ui.label("模型:");
-
-                for (model, label) in [
-                    (ModelSize::Small, ModelSize::Small.name()),
-                    (ModelSize::Medium, ModelSize::Medium.name()),
-                    (ModelSize::Large, ModelSize::Large.name()),
-                ] {
+                // Quick model buttons
+                for model in ModelSize::all() {
+                    let available = self.is_model_available(model);
                     let is_loaded = self.loaded_model == Some(model);
-                    let btn = if is_loaded {
-                        egui::Button::new(format!("✓ {}", label))
-                            .fill(egui::Color32::from_rgb(34, 197, 94)) // Green for active
+                    let downloading = self.downloading_models.contains(&model);
+
+                    let btn_text = if downloading {
+                        format!("{} ⏳", model.name())
+                    } else if is_loaded {
+                        format!("{} ●", model.name())
+                    } else if available {
+                        model.name().to_string()
                     } else {
-                        egui::Button::new(label)
+                        format!("{} ✗", model.name())
                     };
 
-                    if ui.add(btn).clicked() && !self.is_loading && !self.is_generating {
-                        self.switch_model(model);
+                    let btn = if is_loaded {
+                        egui::Button::new(&btn_text)
+                            .fill(egui::Color32::from_rgb(34, 197, 94))
+                    } else if !available {
+                        egui::Button::new(&btn_text)
+                            .fill(egui::Color32::from_rgb(239, 68, 68))
+                    } else {
+                        egui::Button::new(&btn_text)
+                    };
+
+                    if ui.add(btn).clicked() && !self.is_loading && !self.is_generating && !downloading {
+                        if !available {
+                            self.download_model(model);
+                        } else {
+                            self.switch_model(model);
+                        }
                     }
                 }
 
                 ui.separator();
+
+                if ui.button("模型管理").clicked() {
+                    self.show_download_manager = true;
+                }
+
+                // Show download progress for active downloads
+                if !self.downloading_models.is_empty() {
+                    ui.separator();
+                    for model in ModelSize::all() {
+                        if self.downloading_models.contains(&model) {
+                            ui.vertical(|ui| {
+                                ui.set_width(120.0);
+                                let progress = self.download_progress.get(&model).copied().unwrap_or(0.0);
+                                ui.add(
+                                    egui::ProgressBar::new(progress / 100.0)
+                                        .text(format!("{} {:.0}%", model.name(), progress))
+                                        .desired_height(16.0)
+                                );
+                            });
+                        }
+                    }
+                }
 
                 if self.is_loading {
                     ui.spinner();
@@ -294,7 +622,7 @@ impl eframe::App for ChatApp {
 
                 ui.separator();
 
-                if ui.button("清空对话").clicked() {
+                if ui.button("清空").clicked() {
                     self.clear_chat();
                 }
 
@@ -312,13 +640,11 @@ impl eframe::App for ChatApp {
                     ui.add_space(100.0);
                     ui.heading("👋 欢迎使用本地 LLM 聊天");
                     ui.add_space(20.0);
-                    ui.label("请从上方点击模型按钮开始（绿色✓表示当前已加载）");
+                    ui.label("点击上方模型按钮开始");
                     ui.add_space(10.0);
-                    ui.label("• 0.5B (快) - 速度最快，适合简单任务");
-                    ui.label("• 1.5B (均衡) - 速度与质量均衡 (推荐)");
-                    ui.label("• 7B (智能) - 最聪明，但需要更多内存");
+                    ui.label("绿色● = 运行中 | 红色✗ = 需下载 | ⏳ = 下载中");
                     ui.add_space(20.0);
-                    ui.label("点击不同模型可随时切换（将清空对话历史）");
+                    ui.label("模型自动下载到: ~/.mofa/models/");
                 });
             } else {
                 egui::ScrollArea::vertical()
@@ -358,7 +684,7 @@ impl eframe::App for ChatApp {
             ui.horizontal(|ui| {
                 let available_width = ui.available_width();
                 let text_edit = egui::TextEdit::multiline(&mut self.input)
-                    .hint_text("输入消息... (Shift+Enter换行, Enter发送)")
+                    .hint_text("输入消息... (Enter发送, Shift+Enter换行)")
                     .desired_rows(2)
                     .lock_focus(true);
 
@@ -367,7 +693,6 @@ impl eframe::App for ChatApp {
                     text_edit
                 );
 
-                // Handle Enter key
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {
                     self.send_message();
                     response.request_focus();
@@ -404,12 +729,11 @@ fn main() {
             // Configure Chinese font support
             let mut fonts = egui::FontDefinitions::default();
 
-            // Try to load system Chinese fonts
             let font_paths = [
-                "/System/Library/Fonts/Hiragino Sans GB.ttc",  // macOS Hiragino (GB has Chinese)
-                "/System/Library/Fonts/STHeiti Light.ttc",  // macOS Heiti
-                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  // Linux WenQuanYi
-                "C:\\Windows\\Fonts\\msyh.ttc",  // Windows Microsoft YaHei
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
+                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+                "C:\\Windows\\Fonts\\msyh.ttc",
             ];
 
             for path in &font_paths {
@@ -419,7 +743,6 @@ fn main() {
                         egui::FontData::from_owned(font_data),
                     );
 
-                    // Add to proportional and monospace families
                     if let Some(proportional) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
                         proportional.push("chinese".to_owned());
                     }
