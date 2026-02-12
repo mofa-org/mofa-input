@@ -1,0 +1,46 @@
+[package]
+name = "mofa-input"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Error handling
+anyhow = "1.0"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client for downloads
+reqwest = { version = "0.11", features = ["stream"] }
+
+# GUI
+egui = "0.24"
+eframe = { version = "0.24", features = ["default"] }
+
+# Audio
+cpal = "0.15"
+hound = "3.5"
+
+# ML/ONNX (for FunASR)
+ort = { version = "1.16", features = ["load-dynamic"] }
+ndarray = "0.15"
+
+# Utilities
+lazy_static = "1.4"
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+[build-dependencies]
+cc = "1.0"
+
+[[bin]]
+name = "mofa-input"
+path = "src/main.rs"
+
+[[bin]]
+name = "test-llm"
+path = "src/bin/test_llm.rs"
