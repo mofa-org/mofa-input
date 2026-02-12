@@ -120,28 +120,45 @@ static char* generate_response(LlmContext* llm, int32_t max_tokens, float temper
         );
     }
 
-    // Tokenize
-    int32_t n_tokens = llama_tokenize(
-        llm->model, buf.data(), strlen(buf.data()),
-        nullptr, 0, true, false
-    );
-    if (n_tokens < 0) {
-        return strdup("[Error: tokenization failed]");
-    }
+    // Ensure buffer is null-terminated at the correct position
+    buf[len] = '\0';
 
-    std::vector<llama_token> tokens(n_tokens);
-    llama_tokenize(
-        llm->model, buf.data(), strlen(buf.data()),
-        tokens.data(), tokens.size(), true, false
+    // Tokenize - IMPORTANT: parse_special=true to handle <|im_start|>, <|im_end|> etc.
+    // First try with estimated buffer size
+    int n_tokens_est = len + 16;  // prompt length + some extra for special tokens
+    std::vector<llama_token> tokens(n_tokens_est);
+
+    int32_t n_tokens = llama_tokenize(
+        llm->model, buf.data(), len,
+        tokens.data(), tokens.size(), true, true  // add_special=true, parse_special=true
     );
+
+    if (n_tokens < 0) {
+        // Buffer too small, resize and retry
+        n_tokens = -n_tokens;
+        tokens.resize(n_tokens);
+        int32_t check = llama_tokenize(
+            llm->model, buf.data(), len,
+            tokens.data(), tokens.size(), true, true
+        );
+        if (check != n_tokens) {
+            return strdup("[Error: tokenization failed]");
+        }
+    } else {
+        tokens.resize(n_tokens);
+    }
 
     // Decode prompt
     llama_batch batch = llama_batch_init(tokens.size(), 0, 1);
     for (size_t i = 0; i < tokens.size(); i++) {
         add_to_batch(batch, tokens[i], (llama_pos)i, i == tokens.size() - 1);
     }
-    llama_decode(llm->ctx, batch);
+    int32_t decode_result = llama_decode(llm->ctx, batch);
     llama_batch_free(batch);
+
+    if (decode_result != 0) {
+        return strdup("[Error: decode failed]");
+    }
 
     // Create sampler
     llama_sampler* smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());

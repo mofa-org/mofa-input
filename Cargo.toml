@@ -44,3 +44,7 @@ path = "src/main.rs"
 [[bin]]
 name = "test-llm"
 path = "src/bin/test_llm.rs"
+
+[[bin]]
+name = "gui-chat"
+path = "src/bin/gui_chat.rs"

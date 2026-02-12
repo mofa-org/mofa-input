@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// Thread-safe wrapper for multi-turn conversations
+#[derive(Clone)]
 pub struct ChatSession {
     engine: Arc<Mutex<ffi::LlmEngine>>,
 }
