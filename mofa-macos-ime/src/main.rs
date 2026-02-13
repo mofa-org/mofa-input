@@ -643,6 +643,7 @@ impl MonitorHandle {
 #[derive(Clone, Copy)]
 struct OverlayHandle {
     window_ptr: usize,
+    status_badge_ptr: usize,
     status_label_ptr: usize,
     preview_label_ptr: usize,
 }
@@ -665,7 +666,7 @@ impl OverlayHandle {
     }
 
     fn show_error(self, message: &str) {
-        self.show("失败", message);
+        self.show("失败了", message);
     }
 
     fn set_status(self, text: &str) {
@@ -713,6 +714,7 @@ impl OverlayHandle {
 
     fn update(self, visible: bool, status: Option<String>, preview: Option<String>) {
         let window_ptr = self.window_ptr;
+        let status_badge_ptr = self.status_badge_ptr;
         let status_ptr = self.status_label_ptr;
         let preview_ptr = self.preview_label_ptr;
         Queue::main().exec_async(move || unsafe {
@@ -723,10 +725,13 @@ impl OverlayHandle {
             let preview_for_layout = preview.map(|p| wrap_preview_text(&p));
 
             if let Some(s) = status {
+                let status_badge = status_badge_ptr as id;
                 let status_label = status_ptr as id;
                 if status_label != nil {
                     let _: () = msg_send![status_label, setStringValue: ns_string(&s)];
-                    set_status_badge_appearance(status_label, &s);
+                }
+                if status_badge != nil {
+                    set_status_badge_appearance(status_badge, &s);
                 }
             }
 
@@ -738,15 +743,22 @@ impl OverlayHandle {
             }
 
             let preview_label = preview_ptr as id;
+            let status_badge = status_badge_ptr as id;
             let status_label = status_ptr as id;
-            if preview_label != nil && status_label != nil {
+            if preview_label != nil && status_label != nil && status_badge != nil {
                 let preview_text = if let Some(current) = preview_for_layout.as_ref() {
                     current.clone()
                 } else {
                     let preview_ns: id = msg_send![preview_label, stringValue];
                     nsstring_to_rust(preview_ns).unwrap_or_default()
                 };
-                layout_overlay_window(window, status_label, preview_label, &preview_text);
+                layout_overlay_window(
+                    window,
+                    status_badge,
+                    status_label,
+                    preview_label,
+                    &preview_text,
+                );
             }
 
             if visible {
@@ -927,8 +939,11 @@ const OVERLAY_HEIGHT: f64 = 50.0;
 const OVERLAY_BOTTOM_MARGIN: f64 = 24.0;
 const OVERLAY_TOP_MARGIN: f64 = 24.0;
 const OVERLAY_SWITCH_DISTANCE: f64 = 210.0;
+const OVERLAY_STATUS_BADGE_X: f64 = 16.0;
 const OVERLAY_STATUS_BADGE_WIDTH: f64 = 92.0;
 const OVERLAY_STATUS_BADGE_HEIGHT: f64 = 33.0;
+const OVERLAY_STATUS_TEXT_X_OFFSET: f64 = -OVERLAY_WIDTH + 85.0;
+const OVERLAY_STATUS_TEXT_Y_OFFSET: f64 = -(OVERLAY_HEIGHT * 0.5) + 17.0;
 const OVERLAY_PREVIEW_MAX_LINES: usize = 6;
 const OVERLAY_PREVIEW_LINE_HEIGHT: f64 = 17.0;
 const OVERLAY_PREVIEW_MIN_HEIGHT: f64 = 20.0;
@@ -1100,6 +1115,7 @@ fn estimate_preview_lines(text: &str) -> usize {
 
 unsafe fn layout_overlay_window(
     window: id,
+    status_badge: id,
     status_label: id,
     preview_label: id,
     preview_text: &str,
@@ -1113,19 +1129,28 @@ unsafe fn layout_overlay_window(
 
     let status_h = OVERLAY_STATUS_BADGE_HEIGHT;
     let status_w = OVERLAY_STATUS_BADGE_WIDTH;
-    let preview_x = status_w + 16.0;
+    let badge_x = OVERLAY_STATUS_BADGE_X;
+    let preview_x = badge_x + status_w + 16.0;
     let preview_w = OVERLAY_WIDTH - preview_x - 10.0;
     let status_y = ((total_h - status_h) * 0.5).floor();
     let preview_y = ((total_h - preview_h) * 0.5).floor();
-    let status_frame = NSRect::new(
-        NSPoint::new(10.0, status_y),
+    let badge_frame = NSRect::new(
+        NSPoint::new(badge_x, status_y),
         NSSize::new(status_w, status_h),
+    );
+    let status_text_frame = NSRect::new(
+        NSPoint::new(
+            OVERLAY_STATUS_TEXT_X_OFFSET,
+            status_y + OVERLAY_STATUS_TEXT_Y_OFFSET,
+        ),
+        NSSize::new(OVERLAY_WIDTH, status_h),
     );
     let preview_frame = NSRect::new(
         NSPoint::new(preview_x, preview_y),
         NSSize::new(preview_w, preview_h),
     );
-    let _: () = msg_send![status_label, setFrame: status_frame];
+    let _: () = msg_send![status_badge, setFrame: badge_frame];
+    let _: () = msg_send![status_label, setFrame: status_text_frame];
     let _: () = msg_send![preview_label, setFrame: preview_frame];
 
     let current_frame: NSRect = msg_send![window, frame];
@@ -1317,11 +1342,33 @@ unsafe fn install_overlay() -> Result<OverlayHandle> {
         let _: () = msg_send![content_layer, setBorderColor: content_border_cg];
     }
 
+    let status_y = (OVERLAY_HEIGHT - OVERLAY_STATUS_BADGE_HEIGHT) * 0.5;
+    let status_badge = NSView::initWithFrame_(
+        NSView::alloc(nil),
+        NSRect::new(
+            NSPoint::new(OVERLAY_STATUS_BADGE_X, status_y),
+            NSSize::new(OVERLAY_STATUS_BADGE_WIDTH, OVERLAY_STATUS_BADGE_HEIGHT),
+        ),
+    );
+    let _: () = msg_send![status_badge, setWantsLayer: YES];
+    let status_badge_layer: id = msg_send![status_badge, layer];
+    if status_badge_layer != nil {
+        let _: () = msg_send![
+            status_badge_layer,
+            setCornerRadius: (OVERLAY_STATUS_BADGE_HEIGHT * 0.5).floor()
+        ];
+        let _: () = msg_send![status_badge_layer, setMasksToBounds: YES];
+    }
+    content.addSubview_(status_badge);
+
     let status_label = NSTextField::initWithFrame_(
         NSTextField::alloc(nil),
         NSRect::new(
-            NSPoint::new(8.0, (OVERLAY_HEIGHT - OVERLAY_STATUS_BADGE_HEIGHT) * 0.5),
-            NSSize::new(OVERLAY_STATUS_BADGE_WIDTH, OVERLAY_STATUS_BADGE_HEIGHT),
+            NSPoint::new(
+                OVERLAY_STATUS_TEXT_X_OFFSET,
+                status_y + OVERLAY_STATUS_TEXT_Y_OFFSET,
+            ),
+            NSSize::new(OVERLAY_WIDTH, OVERLAY_STATUS_BADGE_HEIGHT),
         ),
     );
     let _: () = msg_send![status_label, setEditable: NO];
@@ -1342,17 +1389,8 @@ unsafe fn install_overlay() -> Result<OverlayHandle> {
         let _: () = msg_send![status_cell, setLineBreakMode: 4usize];
         let _: () = msg_send![status_cell, setAlignment: 2usize];
     }
-    let _: () = msg_send![status_label, setWantsLayer: YES];
-    let status_layer: id = msg_send![status_label, layer];
-    if status_layer != nil {
-        let _: () = msg_send![
-            status_layer,
-            setCornerRadius: (OVERLAY_STATUS_BADGE_HEIGHT * 0.5).floor()
-        ];
-        let _: () = msg_send![status_layer, setMasksToBounds: YES];
-    }
     let _: () = msg_send![status_label, setStringValue: ns_string("就绪")];
-    set_status_badge_appearance(status_label, "就绪");
+    set_status_badge_appearance(status_badge, "就绪");
     content.addSubview_(status_label);
 
     let preview_label = NSTextField::initWithFrame_(
@@ -1389,6 +1427,7 @@ unsafe fn install_overlay() -> Result<OverlayHandle> {
 
     Ok(OverlayHandle {
         window_ptr: window as usize,
+        status_badge_ptr: status_badge as usize,
         status_label_ptr: status_label as usize,
         preview_label_ptr: preview_label as usize,
     })
