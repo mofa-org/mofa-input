@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         options,
         Box::new(|cc| {
             setup_cjk_font(&cc.egui_ctx);
+            setup_ui_style(&cc.egui_ctx);
             Box::new(ModelManagerApp::new())
         }),
     )
@@ -64,6 +65,17 @@ fn setup_cjk_font(ctx: &egui::Context) {
         ctx.set_fonts(fonts);
         return;
     }
+}
+
+fn setup_ui_style(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.interact_size.y = 30.0;
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    ctx.set_style(style);
+}
+
+fn centered_button(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Button::new(label).min_size(egui::vec2(0.0, 30.0)))
 }
 
 const HOTKEY_FN_CODE: u16 = u16::MAX;
@@ -1030,9 +1042,9 @@ impl ModelManagerApp {
                             }
                         });
 
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if available {
-                                if ui.button("删除").clicked() {
+                                if centered_button(ui, "删除").clicked() {
                                     self.delete_model(entry);
                                 }
                             } else {
@@ -1040,7 +1052,8 @@ impl ModelManagerApp {
                                     "下载中..."
                                 } else {
                                     "下载"
-                                });
+                                })
+                                .min_size(egui::vec2(0.0, 30.0));
                                 if ui.add_enabled(!downloading, button).clicked() {
                                     self.download_model(entry.clone());
                                 }
@@ -1081,17 +1094,17 @@ impl eframe::App for ModelManagerApp {
                 ui.label("快捷键:");
                 ui.monospace(self.config.hotkey.label());
                 if self.hotkey_recording {
-                    if ui.button("取消录制").clicked() {
+                    if centered_button(ui, "取消录制").clicked() {
                         self.cancel_hotkey_recording();
                     }
-                } else if ui.button("开始录制").clicked() {
+                } else if centered_button(ui, "开始录制").clicked() {
                     self.start_hotkey_recording();
                 }
-                if ui.button("设为 Fn").clicked() {
+                if centered_button(ui, "设为 Fn").clicked() {
                     self.hotkey_recording = false;
                     self.save_hotkey_setting(HotkeySpec::fn_key());
                 }
-                if ui.button("重新读取").clicked() {
+                if centered_button(ui, "重新读取").clicked() {
                     self.hotkey_recording = false;
                     self.reload_hotkey_setting();
                 }
@@ -1180,7 +1193,7 @@ impl eframe::App for ModelManagerApp {
                     });
             });
 
-            if ui.button("保存运行设置").clicked() {
+            if centered_button(ui, "保存运行设置").clicked() {
                 setting_changed = true;
             }
             if old_output != self.config.output_mode
@@ -1195,10 +1208,10 @@ impl eframe::App for ModelManagerApp {
             ui.add_space(8.0);
 
             ui.horizontal(|ui| {
-                if ui.button("打开模型目录").clicked() {
+                if centered_button(ui, "打开模型目录").clicked() {
                     self.open_model_dir();
                 }
-                if ui.button("刷新").clicked() {
+                if centered_button(ui, "刷新").clicked() {
                     self.status = "已刷新".to_string();
                 }
                 ui.label(format!("状态: {}", self.status));

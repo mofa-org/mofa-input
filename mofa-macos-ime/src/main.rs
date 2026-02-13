@@ -3,9 +3,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use cocoa::appkit::{
     NSApplication, NSApplicationActivationPolicyAccessory, NSBackingStoreBuffered, NSButton,
-    NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSStatusBar, NSStatusItem,
-    NSTextField, NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSMainMenuWindowLevel,
+    NSMainMenuWindowLevel, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString, NSStatusBar,
+    NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use cocoa::base::{id, nil, NO, YES};
 use cocoa::foundation::{NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
@@ -13,22 +13,22 @@ use core_foundation::base::{CFRelease, CFType, TCFType};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop, CFRunLoopSource};
 use core_foundation::string::CFString;
 use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions,
-    CGEventTapPlacement, CGEventType, CGKeyCode, EventField, KeyCode,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CGKeyCode, EventField, KeyCode,
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use dispatch::Queue;
-use objc::{class, msg_send, sel, sel_impl};
 use objc::declare::ClassDecl;
 use objc::runtime::{Class, Object, Sel};
+use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::process::Command;
 use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -77,7 +77,6 @@ fn run_app() -> Result<()> {
 }
 
 static HOTKEY_STORE: OnceLock<Arc<std::sync::atomic::AtomicUsize>> = OnceLock::new();
-static LAST_OVERLAY_ORIGIN: OnceLock<Mutex<Option<(f64, f64)>>> = OnceLock::new();
 const HOTKEY_FN_CODE: u16 = u16::MAX;
 const HOTKEY_MOD_CMD: u8 = 1 << 0;
 const HOTKEY_MOD_CTRL: u8 = 1 << 1;
@@ -544,15 +543,13 @@ fn load_app_config() -> AppConfig {
 }
 
 fn spawn_hotkey_config_watcher(store: Arc<std::sync::atomic::AtomicUsize>) {
-    std::thread::spawn(move || {
-        loop {
-            let loaded = load_app_config().hotkey;
-            let current = HotkeySpec::unpack(store.load(Ordering::SeqCst));
-            if loaded != current {
-                store.store(loaded.pack(), Ordering::SeqCst);
-            }
-            std::thread::sleep(Duration::from_secs(1));
+    std::thread::spawn(move || loop {
+        let loaded = load_app_config().hotkey;
+        let current = HotkeySpec::unpack(store.load(Ordering::SeqCst));
+        if loaded != current {
+            store.store(loaded.pack(), Ordering::SeqCst);
         }
+        std::thread::sleep(Duration::from_secs(1));
     });
 }
 
@@ -676,7 +673,7 @@ impl OverlayHandle {
     }
 
     fn set_preview(self, text: &str) {
-        let line = truncate_middle(&text.replace('\n', " "), 72);
+        let line = wrap_preview_text(text);
         self.update(true, None, Some(line));
     }
 
@@ -710,7 +707,7 @@ impl OverlayHandle {
         self.update(
             true,
             Some(status.to_string()),
-            Some(truncate_middle(&preview.replace('\n', " "), 72)),
+            Some(wrap_preview_text(preview)),
         );
     }
 
@@ -723,23 +720,37 @@ impl OverlayHandle {
             if window == nil {
                 return;
             }
+            let preview_for_layout = preview.map(|p| wrap_preview_text(&p));
 
             if let Some(s) = status {
                 let status_label = status_ptr as id;
                 if status_label != nil {
                     let _: () = msg_send![status_label, setStringValue: ns_string(&s)];
+                    set_status_badge_appearance(status_label, &s);
                 }
             }
 
-            if let Some(p) = preview {
+            if let Some(p) = preview_for_layout.as_ref() {
                 let preview_label = preview_ptr as id;
                 if preview_label != nil {
-                    let _: () = msg_send![preview_label, setStringValue: ns_string(&p)];
+                    let _: () = msg_send![preview_label, setStringValue: ns_string(p)];
                 }
+            }
+
+            let preview_label = preview_ptr as id;
+            let status_label = status_ptr as id;
+            if preview_label != nil && status_label != nil {
+                let preview_text = if let Some(current) = preview_for_layout.as_ref() {
+                    current.clone()
+                } else {
+                    let preview_ns: id = msg_send![preview_label, stringValue];
+                    nsstring_to_rust(preview_ns).unwrap_or_default()
+                };
+                layout_overlay_window(window, status_label, preview_label, &preview_text);
             }
 
             if visible {
-                position_overlay_window_near_caret(window);
+                position_overlay_window(window);
                 let _: () = msg_send![window, setAlphaValue: 1.0f64];
                 window.orderFrontRegardless();
             } else {
@@ -767,11 +778,12 @@ fn truncate_middle(s: &str, max_chars: usize) -> String {
     out
 }
 
-unsafe fn make_info_item(title: &str) -> id {
+unsafe fn make_info_item(title: &str, target: id) -> id {
     let item = NSMenuItem::alloc(nil)
-        .initWithTitle_action_keyEquivalent_(ns_string(title), sel!(terminate:), ns_string(""))
+        .initWithTitle_action_keyEquivalent_(ns_string(title), sel!(noopInfo:), ns_string(""))
         .autorelease();
-    let _: i8 = msg_send![item, setEnabled: NO];
+    NSMenuItem::setTarget_(item, target);
+    let _: () = msg_send![item, setEnabled: NO];
     item
 }
 
@@ -780,6 +792,8 @@ extern "C" fn open_model_manager_action(_this: &Object, _cmd: Sel, _sender: id) 
         eprintln!("[mofa-ime] 打开模型管理器失败: {e}");
     }
 }
+
+extern "C" fn noop_info_action(_this: &Object, _cmd: Sel, _sender: id) {}
 
 fn menu_handler_class() -> *const Class {
     static CLS: OnceLock<usize> = OnceLock::new();
@@ -790,6 +804,10 @@ fn menu_handler_class() -> *const Class {
         decl.add_method(
             sel!(openModelManager:),
             open_model_manager_action as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(noopInfo:),
+            noop_info_action as extern "C" fn(&Object, Sel, id),
         );
         (decl.register() as *const Class) as usize
     }) as *const Class
@@ -803,9 +821,7 @@ unsafe fn new_menu_handler() -> id {
 
 fn spawn_model_manager() -> Result<()> {
     let exe = std::env::current_exe().context("无法获取当前可执行文件路径")?;
-    let bin_dir = exe
-        .parent()
-        .ok_or_else(|| anyhow!("无法获取可执行目录"))?;
+    let bin_dir = exe.parent().ok_or_else(|| anyhow!("无法获取可执行目录"))?;
     let project_dir = bin_dir
         .parent()
         .and_then(|p| p.parent())
@@ -840,9 +856,7 @@ fn spawn_model_manager() -> Result<()> {
     bail!("未找到 model-manager 可执行文件");
 }
 
-unsafe fn install_status_item(
-    app: id,
-) -> Result<(StatusHandle, MonitorHandle, id, id, id)> {
+unsafe fn install_status_item(app: id) -> Result<(StatusHandle, MonitorHandle, id, id, id)> {
     let status_bar = NSStatusBar::systemStatusBar(nil);
     if status_bar == nil {
         bail!("无法创建 NSStatusBar");
@@ -861,10 +875,11 @@ unsafe fn install_status_item(
     set_status_button_symbol(button, TrayState::Idle.symbol_name());
 
     let menu = NSMenu::new(nil).autorelease();
-    let state_item = make_info_item("状态: 就绪");
-    let asr_item = make_info_item("识别: -");
-    let output_item = make_info_item("发送: -");
-    let hint_item = make_info_item("提示: -");
+    let menu_handler = new_menu_handler();
+    let state_item = make_info_item("状态: 就绪", menu_handler);
+    let asr_item = make_info_item("识别: -", menu_handler);
+    let output_item = make_info_item("发送: -", menu_handler);
+    let hint_item = make_info_item("提示: -", menu_handler);
 
     menu.addItem_(state_item);
     menu.addItem_(asr_item);
@@ -872,7 +887,6 @@ unsafe fn install_status_item(
     menu.addItem_(hint_item);
     menu.addItem_(NSMenuItem::separatorItem(nil));
 
-    let menu_handler = new_menu_handler();
     let settings_item = NSMenuItem::alloc(nil)
         .initWithTitle_action_keyEquivalent_(
             ns_string("设置..."),
@@ -908,8 +922,18 @@ unsafe fn install_status_item(
     ))
 }
 
-const OVERLAY_WIDTH: f64 = 360.0;
-const OVERLAY_HEIGHT: f64 = 78.0;
+const OVERLAY_WIDTH: f64 = 560.0;
+const OVERLAY_HEIGHT: f64 = 50.0;
+const OVERLAY_BOTTOM_MARGIN: f64 = 24.0;
+const OVERLAY_TOP_MARGIN: f64 = 24.0;
+const OVERLAY_SWITCH_DISTANCE: f64 = 210.0;
+const OVERLAY_STATUS_BADGE_WIDTH: f64 = 92.0;
+const OVERLAY_STATUS_BADGE_HEIGHT: f64 = 33.0;
+const OVERLAY_PREVIEW_MAX_LINES: usize = 6;
+const OVERLAY_PREVIEW_LINE_HEIGHT: f64 = 17.0;
+const OVERLAY_PREVIEW_MIN_HEIGHT: f64 = 20.0;
+const OVERLAY_PREVIEW_LINE_CAP: f32 = 24.0;
+const OVERLAY_MAX_HEIGHT: f64 = 158.0;
 const ASR_PREVIEW_HOLD_MS: u64 = 900;
 const RESULT_OVERLAY_HOLD_MS: u64 = 950;
 const OVERLAY_FADE_TOTAL_MS: u64 = 120;
@@ -951,7 +975,13 @@ unsafe fn visible_frame() -> NSRect {
     }
 }
 
-fn clamp_overlay_origin(mut x: f64, mut y: f64, width: f64, height: f64, frame: NSRect) -> (f64, f64) {
+fn clamp_overlay_origin(
+    mut x: f64,
+    mut y: f64,
+    width: f64,
+    height: f64,
+    frame: NSRect,
+) -> (f64, f64) {
     let min_x = frame.origin.x + 6.0;
     let max_x = frame.origin.x + frame.size.width - width - 6.0;
     let min_y = frame.origin.y + 6.0;
@@ -972,15 +1002,137 @@ fn clamp_overlay_origin(mut x: f64, mut y: f64, width: f64, height: f64, frame: 
     (x, y)
 }
 
-fn overlay_origin_store() -> &'static Mutex<Option<(f64, f64)>> {
-    LAST_OVERLAY_ORIGIN.get_or_init(|| Mutex::new(None))
-}
-
 fn point_in_frame(p: NSPoint, frame: NSRect) -> bool {
     p.x >= frame.origin.x
         && p.x <= frame.origin.x + frame.size.width
         && p.y >= frame.origin.y
         && p.y <= frame.origin.y + frame.size.height
+}
+
+fn is_cjk_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF
+            | 0x3400..=0x4DBF
+            | 0x3000..=0x303F
+            | 0x3040..=0x309F
+            | 0x30A0..=0x30FF
+            | 0xAC00..=0xD7AF
+    )
+}
+
+fn preview_char_unit(ch: char) -> f32 {
+    if ch.is_ascii_alphabetic() || ch.is_ascii_digit() {
+        0.58
+    } else if ch.is_ascii_punctuation() {
+        0.42
+    } else if is_cjk_char(ch) {
+        1.0
+    } else {
+        0.72
+    }
+}
+
+fn wrap_preview_text(raw: &str) -> String {
+    let text = raw.replace('\r', "");
+    if text.trim().is_empty() {
+        return String::new();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut width_units = 0.0f32;
+    let mut truncated = false;
+
+    for ch in text.chars() {
+        let ch = if ch == '\t' { ' ' } else { ch };
+        if ch == '\n' {
+            lines.push(current);
+            current = String::new();
+            width_units = 0.0;
+            if lines.len() >= OVERLAY_PREVIEW_MAX_LINES {
+                truncated = true;
+                break;
+            }
+            continue;
+        }
+
+        let unit = preview_char_unit(ch);
+        if width_units + unit > OVERLAY_PREVIEW_LINE_CAP {
+            lines.push(current);
+            current = String::new();
+            width_units = 0.0;
+            if lines.len() >= OVERLAY_PREVIEW_MAX_LINES {
+                truncated = true;
+                break;
+            }
+        }
+
+        current.push(ch);
+        width_units += unit;
+    }
+
+    if !current.is_empty() && lines.len() < OVERLAY_PREVIEW_MAX_LINES {
+        lines.push(current);
+    } else if !current.is_empty() {
+        truncated = true;
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    if truncated {
+        if let Some(last) = lines.last_mut() {
+            if !last.ends_with('…') {
+                last.push('…');
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn estimate_preview_lines(text: &str) -> usize {
+    let cnt = text.lines().count();
+    cnt.max(1).min(OVERLAY_PREVIEW_MAX_LINES)
+}
+
+unsafe fn layout_overlay_window(
+    window: id,
+    status_label: id,
+    preview_label: id,
+    preview_text: &str,
+) {
+    let lines = estimate_preview_lines(preview_text);
+    let preview_h = (OVERLAY_PREVIEW_LINE_HEIGHT * lines as f64).max(OVERLAY_PREVIEW_MIN_HEIGHT);
+    let mut total_h = (preview_h + 18.0).max(OVERLAY_HEIGHT);
+    if total_h > OVERLAY_MAX_HEIGHT {
+        total_h = OVERLAY_MAX_HEIGHT;
+    }
+
+    let status_h = OVERLAY_STATUS_BADGE_HEIGHT;
+    let status_w = OVERLAY_STATUS_BADGE_WIDTH;
+    let preview_x = status_w + 16.0;
+    let preview_w = OVERLAY_WIDTH - preview_x - 10.0;
+    let status_y = ((total_h - status_h) * 0.5).floor();
+    let preview_y = ((total_h - preview_h) * 0.5).floor();
+    let status_frame = NSRect::new(
+        NSPoint::new(10.0, status_y),
+        NSSize::new(status_w, status_h),
+    );
+    let preview_frame = NSRect::new(
+        NSPoint::new(preview_x, preview_y),
+        NSSize::new(preview_w, preview_h),
+    );
+    let _: () = msg_send![status_label, setFrame: status_frame];
+    let _: () = msg_send![preview_label, setFrame: preview_frame];
+
+    let current_frame: NSRect = msg_send![window, frame];
+    if (current_frame.size.height - total_h).abs() > 0.5 {
+        let resized = NSRect::new(current_frame.origin, NSSize::new(OVERLAY_WIDTH, total_h));
+        let _: () = msg_send![window, setFrame: resized display: NO];
+    }
 }
 
 unsafe fn focused_caret_rect() -> Option<AxRect> {
@@ -995,11 +1147,8 @@ unsafe fn focused_caret_rect() -> Option<AxRect> {
 
     let focused_attr = CFString::new("AXFocusedUIElement");
     let mut focused_val: core_foundation_sys::base::CFTypeRef = std::ptr::null();
-    let copy_err = AXUIElementCopyAttributeValue(
-        system,
-        focused_attr.as_concrete_TypeRef(),
-        &mut focused_val,
-    );
+    let copy_err =
+        AXUIElementCopyAttributeValue(system, focused_attr.as_concrete_TypeRef(), &mut focused_val);
     CFRelease(system as core_foundation_sys::base::CFTypeRef);
 
     if copy_err != 0 || focused_val.is_null() {
@@ -1009,11 +1158,8 @@ unsafe fn focused_caret_rect() -> Option<AxRect> {
     let focused = focused_val as AXUIElementRef;
     let range_attr = CFString::new("AXSelectedTextRange");
     let mut range_val: core_foundation_sys::base::CFTypeRef = std::ptr::null();
-    let range_err = AXUIElementCopyAttributeValue(
-        focused,
-        range_attr.as_concrete_TypeRef(),
-        &mut range_val,
-    );
+    let range_err =
+        AXUIElementCopyAttributeValue(focused, range_attr.as_concrete_TypeRef(), &mut range_val);
     if range_err != 0 || range_val.is_null() {
         CFRelease(focused as core_foundation_sys::base::CFTypeRef);
         return None;
@@ -1055,45 +1201,61 @@ unsafe fn focused_caret_rect() -> Option<AxRect> {
     }
 }
 
-unsafe fn position_overlay_window_near_caret(window: id) {
+fn pick_focus_point(frame: NSRect, mouse: NSPoint, caret: AxRect) -> Option<NSPoint> {
+    let center_x = caret.origin.x + caret.size.width * 0.5;
+    let y_bottom_origin = caret.origin.y + caret.size.height * 0.5;
+    let y_top_origin =
+        frame.origin.y + frame.size.height - caret.origin.y - caret.size.height * 0.5;
+
+    let candidates = [
+        NSPoint::new(center_x, y_bottom_origin),
+        NSPoint::new(center_x, y_top_origin),
+    ];
+
+    let mut best: Option<(f64, NSPoint)> = None;
+    for point in candidates {
+        if !point_in_frame(point, frame) {
+            continue;
+        }
+        let dist2 = (point.x - mouse.x).powi(2) + (point.y - mouse.y).powi(2);
+        match best {
+            None => best = Some((dist2, point)),
+            Some((curr, _)) if dist2 < curr => best = Some((dist2, point)),
+            _ => {}
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+unsafe fn position_overlay_window(window: id) {
     let frame = visible_frame();
     let window_frame = NSWindow::frame(window);
     let width = window_frame.size.width;
     let height = window_frame.size.height;
-
-    let fallback_mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    let mut x = fallback_mouse.x + 2.0;
-    let mut y = fallback_mouse.y - height - 10.0;
-    if let Ok(last) = overlay_origin_store().lock() {
-        if let Some((lx, ly)) = *last {
-            x = lx;
-            y = ly;
-        }
-    }
-    if !point_in_frame(fallback_mouse, frame) {
-        let center_x = frame.origin.x + (frame.size.width - width) / 2.0;
-        let center_y = frame.origin.y + frame.size.height - height - 60.0;
-        x = center_x;
-        y = center_y;
-    }
-
-    if let Some(caret) = focused_caret_rect() {
-        let y_from_top = frame.origin.y + frame.size.height - caret.origin.y - caret.size.height - height - 8.0;
-        let y_from_bottom = caret.origin.y - height - 8.0;
-        let min_y = frame.origin.y + 6.0;
-        let max_y = frame.origin.y + frame.size.height - height - 6.0;
-        y = if y_from_top >= min_y && y_from_top <= max_y {
-            y_from_top
+    let x = frame.origin.x + (frame.size.width - width) * 0.5;
+    let bottom_y = frame.origin.y + OVERLAY_BOTTOM_MARGIN;
+    let top_y = frame.origin.y + frame.size.height - height - OVERLAY_TOP_MARGIN;
+    let bottom_center = NSPoint::new(x + width * 0.5, bottom_y + height * 0.5);
+    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    let focus = if let Some(caret) = focused_caret_rect() {
+        pick_focus_point(frame, mouse, caret)
+    } else if point_in_frame(mouse, frame) {
+        Some(mouse)
+    } else {
+        None
+    };
+    let y = if let Some(p) = focus {
+        let dx = p.x - bottom_center.x;
+        let dy = p.y - bottom_center.y;
+        if dx * dx + dy * dy <= OVERLAY_SWITCH_DISTANCE * OVERLAY_SWITCH_DISTANCE {
+            top_y
         } else {
-            y_from_bottom
-        };
-        x = caret.origin.x;
-    }
-
+            bottom_y
+        }
+    } else {
+        bottom_y
+    };
     let (x, y) = clamp_overlay_origin(x, y, width, height, frame);
-    if let Ok(mut last) = overlay_origin_store().lock() {
-        *last = Some((x, y));
-    }
     window.setFrameOrigin_(NSPoint::new(x, y));
 }
 
@@ -1102,7 +1264,7 @@ unsafe fn install_overlay() -> Result<OverlayHandle> {
     let width = OVERLAY_WIDTH;
     let height = OVERLAY_HEIGHT;
     let x = frame.origin.x + (frame.size.width - width) / 2.0;
-    let y = frame.origin.y + frame.size.height - height - 54.0;
+    let y = frame.origin.y + OVERLAY_BOTTOM_MARGIN;
     let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
 
     let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
@@ -1115,14 +1277,8 @@ unsafe fn install_overlay() -> Result<OverlayHandle> {
         bail!("无法创建浮层窗口");
     }
 
-    let bg: id = msg_send![
-        class!(NSColor),
-        colorWithCalibratedRed: 0.09f64
-        green: 0.11f64
-        blue: 0.15f64
-        alpha: 0.94f64
-    ];
-    window.setBackgroundColor_(bg);
+    let clear_color: id = msg_send![class!(NSColor), clearColor];
+    window.setBackgroundColor_(clear_color);
     window.setOpaque_(NO);
     window.setHasShadow_(YES);
     window.setIgnoresMouseEvents_(YES);
@@ -1139,49 +1295,94 @@ unsafe fn install_overlay() -> Result<OverlayHandle> {
     if content == nil {
         bail!("浮层 contentView 为空");
     }
+    let _: () = msg_send![content, setWantsLayer: YES];
+    let content_layer: id = msg_send![content, layer];
+    if content_layer != nil {
+        let content_bg: id = msg_send![
+            class!(NSColor),
+            colorWithCalibratedWhite: 0.16f64
+            alpha: 0.93f64
+        ];
+        let content_border: id = msg_send![
+            class!(NSColor),
+            colorWithCalibratedWhite: 0.44f64
+            alpha: 0.34f64
+        ];
+        let content_bg_cg: id = msg_send![content_bg, CGColor];
+        let content_border_cg: id = msg_send![content_border, CGColor];
+        let _: () = msg_send![content_layer, setCornerRadius: 15.0f64];
+        let _: () = msg_send![content_layer, setMasksToBounds: YES];
+        let _: () = msg_send![content_layer, setBackgroundColor: content_bg_cg];
+        let _: () = msg_send![content_layer, setBorderWidth: 1.0f64];
+        let _: () = msg_send![content_layer, setBorderColor: content_border_cg];
+    }
 
-    let status_label = NSTextField::initWithFrame_(NSTextField::alloc(nil), NSRect::new(
-        NSPoint::new(14.0, 42.0),
-        NSSize::new(332.0, 22.0),
-    ));
+    let status_label = NSTextField::initWithFrame_(
+        NSTextField::alloc(nil),
+        NSRect::new(
+            NSPoint::new(8.0, (OVERLAY_HEIGHT - OVERLAY_STATUS_BADGE_HEIGHT) * 0.5),
+            NSSize::new(OVERLAY_STATUS_BADGE_WIDTH, OVERLAY_STATUS_BADGE_HEIGHT),
+        ),
+    );
     let _: () = msg_send![status_label, setEditable: NO];
     let _: () = msg_send![status_label, setSelectable: NO];
     let _: () = msg_send![status_label, setBezeled: NO];
     let _: () = msg_send![status_label, setBordered: NO];
     let _: () = msg_send![status_label, setDrawsBackground: NO];
-    let status_font: id = msg_send![class!(NSFont), boldSystemFontOfSize: 14.0f64];
+    let _: () = msg_send![status_label, setAlignment: 2usize];
+    let status_font: id = msg_send![class!(NSFont), boldSystemFontOfSize: 13.0f64];
     let _: () = msg_send![status_label, setFont: status_font];
-    let status_color: id = msg_send![
-        class!(NSColor),
-        colorWithCalibratedRed: 0.96f64
-        green: 0.97f64
-        blue: 0.99f64
-        alpha: 1.0f64
-    ];
+    let status_color: id = msg_send![class!(NSColor), whiteColor];
     let _: () = msg_send![status_label, setTextColor: status_color];
-    let _: () = msg_send![status_label, setStringValue: ns_string("准备就绪")];
+    let status_cell: id = msg_send![status_label, cell];
+    if status_cell != nil {
+        let _: () = msg_send![status_cell, setWraps: NO];
+        let _: () = msg_send![status_cell, setScrollable: NO];
+        let _: () = msg_send![status_cell, setUsesSingleLineMode: YES];
+        let _: () = msg_send![status_cell, setLineBreakMode: 4usize];
+        let _: () = msg_send![status_cell, setAlignment: 2usize];
+    }
+    let _: () = msg_send![status_label, setWantsLayer: YES];
+    let status_layer: id = msg_send![status_label, layer];
+    if status_layer != nil {
+        let _: () = msg_send![
+            status_layer,
+            setCornerRadius: (OVERLAY_STATUS_BADGE_HEIGHT * 0.5).floor()
+        ];
+        let _: () = msg_send![status_layer, setMasksToBounds: YES];
+    }
+    let _: () = msg_send![status_label, setStringValue: ns_string("就绪")];
+    set_status_badge_appearance(status_label, "就绪");
     content.addSubview_(status_label);
 
-    let preview_label = NSTextField::initWithFrame_(NSTextField::alloc(nil), NSRect::new(
-        NSPoint::new(14.0, 16.0),
-        NSSize::new(332.0, 18.0),
-    ));
+    let preview_label = NSTextField::initWithFrame_(
+        NSTextField::alloc(nil),
+        NSRect::new(NSPoint::new(108.0, 15.0), NSSize::new(442.0, 20.0)),
+    );
     let _: () = msg_send![preview_label, setEditable: NO];
     let _: () = msg_send![preview_label, setSelectable: NO];
     let _: () = msg_send![preview_label, setBezeled: NO];
     let _: () = msg_send![preview_label, setBordered: NO];
     let _: () = msg_send![preview_label, setDrawsBackground: NO];
-    let preview_font: id = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let _: () = msg_send![preview_label, setAlignment: 0usize];
+    let preview_font: id = msg_send![class!(NSFont), systemFontOfSize: 15.0f64];
     let _: () = msg_send![preview_label, setFont: preview_font];
     let preview_color: id = msg_send![
         class!(NSColor),
-        colorWithCalibratedRed: 0.82f64
-        green: 0.86f64
-        blue: 0.92f64
+        colorWithCalibratedRed: 0.94f64
+        green: 0.91f64
+        blue: 0.78f64
         alpha: 1.0f64
     ];
     let _: () = msg_send![preview_label, setTextColor: preview_color];
-    let _: () = msg_send![preview_label, setStringValue: ns_string("按住快捷键开始语音输入")];
+    let cell: id = msg_send![preview_label, cell];
+    if cell != nil {
+        let _: () = msg_send![cell, setWraps: YES];
+        let _: () = msg_send![cell, setScrollable: NO];
+        let _: () = msg_send![cell, setUsesSingleLineMode: NO];
+        let _: () = msg_send![cell, setLineBreakMode: 0usize];
+    }
+    let _: () = msg_send![preview_label, setStringValue: ns_string("按住快捷键说话")];
     content.addSubview_(preview_label);
 
     window.orderOut_(nil);
@@ -1195,6 +1396,41 @@ unsafe fn install_overlay() -> Result<OverlayHandle> {
 
 unsafe fn ns_string(s: &str) -> id {
     NSString::alloc(nil).init_str(s).autorelease()
+}
+
+unsafe fn set_status_badge_appearance(status_label: id, status: &str) {
+    if status_label == nil {
+        return;
+    }
+    let (r, g, b) = if status.contains("录音") {
+        (0.20, 0.44, 0.95)
+    } else if status.contains("转录") || status.contains("识别") {
+        (0.35, 0.37, 0.44)
+    } else if status.contains("润色") {
+        (0.56, 0.43, 0.16)
+    } else if status.contains("发送") || status.contains("注入") || status.contains("就绪") {
+        (0.19, 0.42, 0.86)
+    } else {
+        (0.58, 0.24, 0.24)
+    };
+    let badge_bg: id = msg_send![
+        class!(NSColor),
+        colorWithCalibratedRed: r
+        green: g
+        blue: b
+        alpha: 1.0f64
+    ];
+    let badge_bg_cg: id = msg_send![badge_bg, CGColor];
+    let status_layer: id = msg_send![status_label, layer];
+    if status_layer != nil {
+        let bounds: NSRect = msg_send![status_label, bounds];
+        let _: () = msg_send![
+            status_layer,
+            setCornerRadius: (bounds.size.height * 0.5).floor()
+        ];
+        let _: () = msg_send![status_layer, setMasksToBounds: YES];
+        let _: () = msg_send![status_layer, setBackgroundColor: badge_bg_cg];
+    }
 }
 
 unsafe fn set_status_button_symbol(button: id, symbol_name: &str) {
@@ -1250,7 +1486,11 @@ fn install_hotkey_tap(
         CGEventTapLocation::Session,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::ListenOnly,
-        vec![CGEventType::FlagsChanged, CGEventType::KeyDown, CGEventType::KeyUp],
+        vec![
+            CGEventType::FlagsChanged,
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+        ],
         move |_proxy, event_type, event| {
             let hotkey = HotkeySpec::unpack(hotkey_store.load(Ordering::SeqCst));
             match event_type {
@@ -1304,8 +1544,7 @@ fn install_hotkey_tap(
                     }
                     let keycode =
                         event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-                    if keycode == hotkey.keycode && combo_pressed_cb.swap(false, Ordering::SeqCst)
-                    {
+                    if keycode == hotkey.keycode && combo_pressed_cb.swap(false, Ordering::SeqCst) {
                         let _ = tx.send(HotkeySignal::Up);
                     }
                 }
@@ -1363,12 +1602,6 @@ fn refresh_models(
         } else {
             monitor.set_hint("未发现可用 ASR 模型");
         }
-    }
-
-    if cfg.output_mode == OutputMode::Asr {
-        *llm = None;
-        *llm_loaded_path = None;
-        return;
     }
 
     let desired_llm = choose_llm_model(model_base, cfg.llm_model);
@@ -1532,32 +1765,33 @@ fn spawn_pipeline_worker(
                     let asr_preview = Arc::new(Mutex::new(String::new()));
                     let asr_preview_cb = Arc::clone(&asr_preview);
                     let overlay_cb = overlay;
-                    let raw_text = match asr_session.transcribe_with_progress(&samples, move |seg| {
-                        let seg = seg.trim();
-                        if seg.is_empty() {
-                            return;
-                        }
-
-                        if let Ok(mut acc) = asr_preview_cb.lock() {
-                            if !acc.is_empty() {
-                                acc.push(' ');
+                    let raw_text =
+                        match asr_session.transcribe_with_progress(&samples, move |seg| {
+                            let seg = seg.trim();
+                            if seg.is_empty() {
+                                return;
                             }
-                            acc.push_str(seg);
-                            overlay_cb.set_preview(acc.as_str());
-                        }
-                    }) {
-                        Ok(t) => t.trim().to_string(),
-                        Err(e) => {
-                            eprintln!("[mofa-ime] ASR 失败: {e}");
-                            status.set(TrayState::Error);
-                            monitor.set_state("ASR 失败");
-                            monitor.set_hint("语音识别失败");
-                            overlay.show_error("语音识别失败");
-                            std::thread::sleep(Duration::from_millis(900));
-                            overlay.fade_out_quick();
-                            continue;
-                        }
-                    };
+
+                            if let Ok(mut acc) = asr_preview_cb.lock() {
+                                if !acc.is_empty() {
+                                    acc.push(' ');
+                                }
+                                acc.push_str(seg);
+                                overlay_cb.set_preview(acc.as_str());
+                            }
+                        }) {
+                            Ok(t) => t.trim().to_string(),
+                            Err(e) => {
+                                eprintln!("[mofa-ime] ASR 失败: {e}");
+                                status.set(TrayState::Error);
+                                monitor.set_state("ASR 失败");
+                                monitor.set_hint("语音识别失败");
+                                overlay.show_error("语音识别失败");
+                                std::thread::sleep(Duration::from_millis(900));
+                                overlay.fade_out_quick();
+                                continue;
+                            }
+                        };
                     let raw_text = normalize_transcript(&raw_text);
                     monitor.set_asr(&raw_text);
                     if !raw_text.is_empty() {
@@ -1721,8 +1955,7 @@ fn compact_for_filter(text: &str) -> String {
             }
             !matches!(
                 c,
-                '，'
-                    | '。'
+                '，' | '。'
                     | '！'
                     | '？'
                     | '；'
@@ -1882,7 +2115,8 @@ impl RecordingTicker {
             while !stop_flag.load(Ordering::SeqCst) {
                 let len = samples.lock().map(|buf| buf.len()).unwrap_or(0);
                 let secs = len as f32 / sample_rate.max(1) as f32;
-                overlay.set_status(&format!("录音中 {:.1}s", secs));
+                overlay.set_status("录音中");
+                overlay.set_preview(&format!("正在听写 {:.1}s", secs));
                 std::thread::sleep(Duration::from_millis(180));
             }
         });
@@ -2224,8 +2458,8 @@ fn type_text_via_events(text: &str) -> Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow!("创建 CGEventSource 失败"))?;
 
-    let key_down =
-        CGEvent::new_keyboard_event(source.clone(), 0, true).map_err(|_| anyhow!("创建文本事件失败"))?;
+    let key_down = CGEvent::new_keyboard_event(source.clone(), 0, true)
+        .map_err(|_| anyhow!("创建文本事件失败"))?;
     key_down.set_string(text);
     key_down.post(CGEventTapLocation::HID);
 
@@ -2254,22 +2488,22 @@ fn post_cmd_v() -> Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow!("创建 CGEventSource 失败"))?;
 
-    let cmd_down =
-        CGEvent::new_keyboard_event(source.clone(), KeyCode::COMMAND, true).map_err(|_| anyhow!("创建 cmd down 失败"))?;
+    let cmd_down = CGEvent::new_keyboard_event(source.clone(), KeyCode::COMMAND, true)
+        .map_err(|_| anyhow!("创建 cmd down 失败"))?;
     cmd_down.post(CGEventTapLocation::HID);
 
-    let v_down =
-        CGEvent::new_keyboard_event(source.clone(), KEY_V, true).map_err(|_| anyhow!("创建 v down 失败"))?;
+    let v_down = CGEvent::new_keyboard_event(source.clone(), KEY_V, true)
+        .map_err(|_| anyhow!("创建 v down 失败"))?;
     v_down.set_flags(CGEventFlags::CGEventFlagCommand);
     v_down.post(CGEventTapLocation::HID);
 
-    let v_up =
-        CGEvent::new_keyboard_event(source.clone(), KEY_V, false).map_err(|_| anyhow!("创建 v up 失败"))?;
+    let v_up = CGEvent::new_keyboard_event(source.clone(), KEY_V, false)
+        .map_err(|_| anyhow!("创建 v up 失败"))?;
     v_up.set_flags(CGEventFlags::CGEventFlagCommand);
     v_up.post(CGEventTapLocation::HID);
 
-    let cmd_up =
-        CGEvent::new_keyboard_event(source, KeyCode::COMMAND, false).map_err(|_| anyhow!("创建 cmd up 失败"))?;
+    let cmd_up = CGEvent::new_keyboard_event(source, KeyCode::COMMAND, false)
+        .map_err(|_| anyhow!("创建 cmd up 失败"))?;
     cmd_up.post(CGEventTapLocation::HID);
 
     Ok(())
