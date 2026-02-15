@@ -204,6 +204,7 @@ impl ModelManagerApp {
                             ui.label(entry.desc);
                             ui.small(format!("文件: {}", entry.file_name));
                             ui.small(format!("预计大小: {}MB", entry.size_mb));
+                            ui.hyperlink_to("手动下载", entry.url);
                             if available {
                                 let actual_mb = path
                                     .metadata()
@@ -228,6 +229,12 @@ impl ModelManagerApp {
                         });
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if centered_button(ui, "复制链接").clicked() {
+                                ui.output_mut(|o| {
+                                    o.copied_text = entry.url.to_string();
+                                });
+                                self.status = format!("已复制链接: {}", entry.name);
+                            }
                             if available {
                                 if centered_button(ui, "删除").clicked() {
                                     self.delete_model(entry);
