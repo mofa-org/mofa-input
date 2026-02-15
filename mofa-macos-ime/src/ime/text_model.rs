@@ -21,8 +21,22 @@ fn choose_llm_model_auto(base: &Path) -> Option<PathBuf> {
         "qwen2.5-0.5b-q4_k_m.gguf"
     } else if mem_gb <= 16 {
         "qwen2.5-1.5b-q4_k_m.gguf"
-    } else {
+    } else if mem_gb <= 24 {
         "qwen2.5-3b-q4_k_m.gguf"
+    } else if mem_gb <= 40 {
+        "qwen3-4b-q4_k_m.gguf"
+    } else if mem_gb <= 64 {
+        "qwen2.5-7b-q4_k_m.gguf"
+    } else if mem_gb <= 96 {
+        "qwen3-8b-q4_k_m.gguf"
+    } else if mem_gb <= 128 {
+        "qwen3-14b-q4_k_m.gguf"
+    } else if mem_gb <= 192 {
+        "qwen3-30b-a3b-q4_k_m.gguf"
+    } else if mem_gb <= 256 {
+        "qwen3-32b-q4_k_m.gguf"
+    } else {
+        "qwen2.5-72b-q4_k_m.gguf"
     };
 
     let mut candidates = vec![
@@ -30,7 +44,21 @@ fn choose_llm_model_auto(base: &Path) -> Option<PathBuf> {
         "qwen2.5-1.5b-q4_k_m.gguf",
         "qwen2.5-0.5b-q4_k_m.gguf",
         "qwen2.5-3b-q4_k_m.gguf",
+        "qwen3-4b-q4_k_m.gguf",
         "qwen2.5-7b-q4_k_m.gguf",
+        "qwen3-8b-q4_k_m.gguf",
+        "qwen2.5-14b-q4_k_m.gguf",
+        "qwen3-14b-q4_k_m.gguf",
+        "qwen3-30b-a3b-q4_k_m.gguf",
+        "qwen2.5-32b-q4_k_m.gguf",
+        "qwen3-32b-q4_k_m.gguf",
+        "qwen2.5-72b-q4_k_m.gguf",
+        "qwen2.5-coder-1.5b-q4_k_m.gguf",
+        "qwen2.5-coder-0.5b-q4_k_m.gguf",
+        "qwen2.5-coder-3b-q4_k_m.gguf",
+        "qwen2.5-coder-7b-q4_k_m.gguf",
+        "qwen2.5-coder-14b-q4_k_m.gguf",
+        "qwen2.5-coder-32b-q4_k_m.gguf",
     ];
     candidates.dedup();
 

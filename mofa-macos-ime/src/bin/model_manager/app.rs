@@ -362,27 +362,13 @@ impl eframe::App for ModelManagerApp {
                 egui::ComboBox::from_id_source("llm_model_choice")
                     .selected_text(self.config.llm_model.label())
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.config.llm_model, LlmChoice::Auto, "自动");
-                        ui.selectable_value(
-                            &mut self.config.llm_model,
-                            LlmChoice::Qwen05,
-                            LlmChoice::Qwen05.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.config.llm_model,
-                            LlmChoice::Qwen15,
-                            LlmChoice::Qwen15.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.config.llm_model,
-                            LlmChoice::Qwen3,
-                            LlmChoice::Qwen3.label(),
-                        );
-                        ui.selectable_value(
-                            &mut self.config.llm_model,
-                            LlmChoice::Qwen7,
-                            LlmChoice::Qwen7.label(),
-                        );
+                        for choice in LlmChoice::all() {
+                            ui.selectable_value(
+                                &mut self.config.llm_model,
+                                choice,
+                                choice.label(),
+                            );
+                        }
                     });
             });
             ui.horizontal(|ui| {
