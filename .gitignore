@@ -1,3 +1,4 @@
 models/
 *.gguf
 target/
+.DS_Store

@@ -2,3 +2,4 @@ target/
 Cargo.lock
 dist/
 scripts/
+.DS_Store
