@@ -32,8 +32,8 @@ const ORB_SIZE: f64 = 48.0;
 const ORB_MARGIN: f64 = 16.0;
 
 // Global state for orb click handling
-static mut ORB_CLICK_TX: Option<std::sync::mpsc::Sender<OrbCommand>> = None;
-static mut ORB_WINDOW_PTR: usize = 0;
+static ORB_CLICK_TX: OnceLock<std::sync::mpsc::Sender<OrbCommand>> = OnceLock::new();
+static ORB_WINDOW_PTR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // History storage (max 50 items)
 const MAX_HISTORY_ITEMS: usize = 50;
@@ -302,14 +302,9 @@ const K_AX_VALUE_CGRECT_TYPE: AXValueType = 3;
 const K_CALAYER_GRAVITY_CENTER: &str = "center";
 
 // Orb click handler class
-static mut ORB_DELEGATE_CLASS: *const objc::runtime::Class = std::ptr::null();
-
 fn get_orb_delegate_class() -> &'static objc::runtime::Class {
-    unsafe {
-        if !ORB_DELEGATE_CLASS.is_null() {
-            return &*ORB_DELEGATE_CLASS;
-        }
-
+    static CLASS: OnceLock<&'static objc::runtime::Class> = OnceLock::new();
+    CLASS.get_or_init(|| unsafe {
         let superclass = objc::runtime::Class::get("NSObject").unwrap();
         let mut decl = objc::declare::ClassDecl::new("OrbClickDelegate", superclass).unwrap();
 
@@ -330,10 +325,8 @@ fn get_orb_delegate_class() -> &'static objc::runtime::Class {
             on_click as extern "C" fn(&objc::runtime::Object, objc::runtime::Sel, id),
         );
 
-        let class = decl.register();
-        ORB_DELEGATE_CLASS = class;
-        &*class
-    }
+        decl.register()
+    })
 }
 
 unsafe fn visible_frame() -> NSRect {
@@ -816,9 +809,7 @@ unsafe fn install_overlay(show_orb: bool) -> Result<OverlayHandle> {
     // Install floating orb (if enabled)
     let orb_window = if show_orb {
         let orb = install_floating_orb()?;
-        unsafe {
-            ORB_WINDOW_PTR = orb as usize;
-        }
+        ORB_WINDOW_PTR.store(orb as usize, Ordering::SeqCst);
         orb
     } else {
         nil
@@ -900,7 +891,7 @@ unsafe fn position_history_window(window: id, _main_overlay_on_top: bool) {
     let history_height = current_frame.size.height.max(HISTORY_MIN_HEIGHT);
 
     // Get orb window position
-    let orb_window = ORB_WINDOW_PTR as id;
+    let orb_window = ORB_WINDOW_PTR.load(Ordering::SeqCst) as id;
     if orb_window == nil {
         // Fallback to default position if orb not available
         let x = screen_frame.origin.x + screen_frame.size.width - history_width - HISTORY_MARGIN;
@@ -1777,7 +1768,7 @@ fn register_orb_tracking_class() -> &'static objc::runtime::Class {
 
                 // If elapsed time < 200ms, treat as click
                 if elapsed < 200 {
-                    if let Some(ref tx) = ORB_CLICK_TX {
+                    if let Some(tx) = ORB_CLICK_TX.get() {
                         let _ = tx.send(OrbCommand::ToggleHistory);
                     }
                 }
@@ -1811,9 +1802,7 @@ fn register_orb_tracking_class() -> &'static objc::runtime::Class {
 
 // Set up orb click handler
 pub fn set_orb_click_handler(tx: std::sync::mpsc::Sender<OrbCommand>) {
-    unsafe {
-        ORB_CLICK_TX = Some(tx);
-    }
+    let _ = ORB_CLICK_TX.set(tx);
 }
 
 // Create delegate for copy buttons
