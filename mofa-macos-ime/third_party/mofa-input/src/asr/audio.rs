@@ -7,6 +7,7 @@ pub struct AudioRecorder {
     samples: Arc<Mutex<Vec<f32>>>,
     stream: Option<Box<dyn StreamTrait>>,
     is_recording: Arc<Mutex<bool>>,
+    sample_rate: u32,
 }
 
 impl AudioRecorder {
@@ -15,6 +16,7 @@ impl AudioRecorder {
             samples: Arc::new(Mutex::new(Vec::new())),
             stream: None,
             is_recording: Arc::new(Mutex::new(false)),
+            sample_rate: 16000,
         }
     }
 
@@ -63,12 +65,7 @@ impl AudioRecorder {
 
         stream.play()?;
         self.stream = Some(Box::new(stream));
-
-        // Resample to 16kHz if needed
-        if sample_rate != 16000 {
-            // Store original sample rate for later resampling
-            // For now, we'll resample after stopping
-        }
+        self.sample_rate = sample_rate;
 
         Ok(())
     }
@@ -79,7 +76,7 @@ impl AudioRecorder {
         self.stream = None;
 
         let samples = self.samples.lock().unwrap().clone();
-        // TODO: Resample to 16kHz if needed
+        let samples = resample_to_16khz(&samples, self.sample_rate);
         Ok(samples)
     }
 
